@@ -1,0 +1,155 @@
+// --- 設定項目 ---
+// 各シートの名前やフォルダ名を変更した場合は、ここを修正してください。
+const MANAGEMENT_SHEET_NAME = "管理表";
+const REPORT_SHEET_NAME = "再検査報告書";
+const PDF_SAVE_FOLDER_NAME = "再検査報告書PDF"; // Google Driveに作成されるフォルダ名
+
+// 管理表の列名（完全一致）
+const COL_NAME_KANJI = "漢字氏名";
+const COL_NAME_RESULT = "結果判定";
+const TARGET_RESULT_VALUE = "再検査"; // PDF作成の対象とする結果判定の値
+
+/**
+ * 「管理表」シートのデータに基づき、「再検査」と判定された人の
+ * 再検査報告書PDFをGoogle Driveに一括で作成します。
+ */
+function createReExaminationPdfs() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const managementSheet = ss.getSheetByName(MANAGEMENT_SHEET_NAME);
+  const reportTemplateSheet = ss.getSheetByName(REPORT_SHEET_NAME);
+
+  // --- 事前チェック ---
+  if (!managementSheet) {
+    SpreadsheetApp.getUi().alert(`エラー: シート「${MANAGEMENT_SHEET_NAME}」が見つかりません。`);
+    return;
+  }
+  if (!reportTemplateSheet) {
+    SpreadsheetApp.getUi().alert(`エラー: シート「${REPORT_SHEET_NAME}」が見つかりません。`);
+    return;
+  }
+
+  // --- PDF保存用フォルダの準備 ---
+  let pdfFolder;
+  const folders = DriveApp.getFoldersByName(PDF_SAVE_FOLDER_NAME);
+  if (folders.hasNext()) {
+    pdfFolder = folders.next();
+  } else {
+    pdfFolder = DriveApp.createFolder(PDF_SAVE_FOLDER_NAME);
+  }
+
+  // --- データ取得と処理 ---
+  const data = managementSheet.getDataRange().getValues();
+  const headers = data.shift(); // ヘッダー行を取得
+
+  // 列名から列インデックスを動的に取得
+  const colIndexKanji = headers.indexOf(COL_NAME_KANJI);
+  const colIndexResult = headers.indexOf(COL_NAME_RESULT);
+
+  if (colIndexKanji === -1 || colIndexResult === -1) {
+    SpreadsheetApp.getUi().alert(`エラー: 「${COL_NAME_KANJI}」または「${COL_NAME_RESULT}」の列が見つかりません。`);
+    return;
+  }
+
+  // 検査項目と報告書の転記先セルの対応表
+  const checkItemsMap = {
+    "血圧": "B17", "脂質": "B18", "肝機能": "B19", "糖代謝": "B20",
+    "尿酸": "E17", "血液一般": "E18", "尿検査": "E19", "胸部レントゲン検査": "E20",
+    "心電図": "H17", "眼・耳": "H18", "胃部": "H19", "便潜血": "H20",
+    "その他": "B21"
+  };
+  
+  let createdCount = 0;
+
+  // 1行ずつデータを確認
+  data.forEach((row, index) => {
+    // 結果判定が「再検査」の行のみ処理
+    if (row[colIndexResult] === TARGET_RESULT_VALUE) {
+      const kanjiName = row[colIndexKanji];
+      if (!kanjiName) {
+        console.warn(`Row ${index + 2}: ${COL_NAME_KANJI}が空のためスキップします。`);
+        return; // 氏名がない場合はスキップ
+      }
+
+      // テンプレートシートを一時的に複製
+      const tempSheet = reportTemplateSheet.copyTo(ss);
+      tempSheet.setName(`_tmp_${kanjiName}`);
+
+      try {
+        // 氏名を転記 (D6:F6を結合して中央揃え)
+        tempSheet.getRange("D6:F6").merge().setValue(kanjiName).setHorizontalAlignment('center');
+
+        // 各検査項目をチェックし、値があれば「◯」を転記
+        Object.keys(checkItemsMap).forEach(itemName => {
+          const itemColIndex = headers.indexOf(itemName);
+          if (itemColIndex !== -1 && row[itemColIndex] !== "") {
+            tempSheet.getRange(checkItemsMap[itemName]).setValue("◯");
+          }
+        });
+
+        SpreadsheetApp.flush(); // シートへの変更を確定
+
+        // --- PDFの作成と保存 ---
+        const pdfBlob = createPdfBlob(ss.getId(), tempSheet.getSheetId(), `${kanjiName}様_再検査報告書`);
+        pdfFolder.createFile(pdfBlob);
+        
+        createdCount++;
+      } catch (e) {
+        console.error(`エラー発生 (対象者: ${kanjiName}): ${e.toString()}`);
+      } finally {
+        // 処理が終わったら一時シートを削除
+        ss.deleteSheet(tempSheet);
+      }
+    }
+  });
+
+  // --- 完了メッセージ ---
+  if (createdCount > 0) {
+    const folderUrl = pdfFolder.getUrl();
+    const htmlOutput = HtmlService.createHtmlOutput(
+      `${createdCount}件のPDFを作成しました。<br>` +
+      `Google Driveの <a href="${folderUrl}" target="_blank">${PDF_SAVE_FOLDER_NAME}</a> フォルダを確認してください。`
+    ).setWidth(400).setHeight(100);
+    SpreadsheetApp.getUi().showModalDialog(htmlOutput, '処理完了');
+  } else {
+    SpreadsheetApp.getUi().alert(`「${COL_NAME_RESULT}」が「${TARGET_RESULT_VALUE}」の対象データは見つかりませんでした。`);
+  }
+}
+
+/**
+ * 特定のシートをPDFのBlobとして生成します。
+ * @param {string} spreadsheetId - スプレッドシートのID
+ * @param {string} sheetId - PDF化するシートのGID
+ * @param {string} pdfName - 生成するPDFのファイル名
+ * @return {Blob} 生成されたPDFのBlobオブジェクト
+ */
+function createPdfBlob(spreadsheetId, sheetId, pdfName) {
+  const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?`;
+  const exportOptions = {
+    exportFormat: 'pdf',
+    format: 'pdf',
+    size: 'A4',            // 用紙サイズ
+    portrait: 'true',      // true: 縦向き, false: 横向き
+    fitw: 'true',          // ページ幅に合わせる
+    sheetnames: 'false',
+    printtitle: 'false',
+    pagenumbers: 'false',
+    gridlines: 'false',    // グリッド線を非表示
+    fzr: 'false',
+    gid: sheetId
+  };
+
+  let params = [];
+  for (const key in exportOptions) {
+    params.push(`${key}=${exportOptions[key]}`);
+  }
+  
+  const token = ScriptApp.getOAuthToken();
+  const response = UrlFetchApp.fetch(url + params.join('&'), {
+    headers: {
+      'Authorization': 'Bearer ' + token
+    },
+    muteHttpExceptions: true
+  });
+  
+  return response.getBlob().setName(`${pdfName}.pdf`);
+}
