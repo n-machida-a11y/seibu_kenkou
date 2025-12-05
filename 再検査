@@ -1,0 +1,145 @@
+/**
+ * スプレッドシートを開いた時に実行される関数
+ * カスタムメニューを追加します。
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('再検査連絡') // メニュー名
+    .addItem('結果連絡', 'sendReExamAlerts')
+    .addItem('再検査報告書PDFを作成', 'createReExaminationPdfs')
+    .addItem('リマインダーメールを送信', 'sendReExamReminder')
+    .addToUi();
+}
+
+/**
+ * 再検査報告書提出のアラートメールを送信するスクリプト
+ */
+function sendReExamAlerts() {
+  // ---【設定項目】---
+  const MANAGEMENT_SHEET_NAME = '管理表'; // 管理表のシート名
+  const CONTACT_SHEET_NAME = '連絡先';   // 連絡先が記載されたシート名
+  // ---【設定はここまで】---
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const managementSheet = ss.getSheetByName(MANAGEMENT_SHEET_NAME);
+    const contactSheet = ss.getSheetByName(CONTACT_SHEET_NAME);
+
+    if (!managementSheet || !contactSheet) {
+      throw new Error('指定されたシートが見つかりません。シート名を確認してください。');
+    }
+
+    // 1. 「連絡先」シートから氏名とメールアドレスの対応表を作成
+    const contactRange = contactSheet.getRange(2, 1, contactSheet.getLastRow() - 1, 2);
+    const contactValues = contactRange.getValues();
+    const contactMap = new Map();
+    for (const row of contactValues) {
+      const name = row[0];
+      const email = row[1];
+      if (name && email) {
+        contactMap.set(name, email);
+      }
+    }
+
+    // 2. 「連絡先」シートからメールの件名と本文テンプレートを取得
+    const subjectTemplate = contactSheet.getRange('G1').getValue();
+    const bodyTemplate = contactSheet.getRange('G2').getValue();
+
+    if (!subjectTemplate || !bodyTemplate) {
+      throw new Error('「連絡先」シートのG1セル（件名）またはG2セル（本文）が空です。');
+    }
+
+    // 3. 「管理表」のデータを取得
+    const managementValues = managementSheet.getDataRange().getValues();
+    const headers = managementValues[0];
+
+    // 4. 列名から列番号を動的に取得（列の順番が変わっても対応可能）
+    const colIndex = {
+      kanjiName: headers.indexOf('漢字氏名'),
+      result: headers.indexOf('結果判定'),
+      resultSentDate: headers.indexOf('結果送付日'),
+      reportArrivalDate: headers.indexOf('報告書到着'),
+      reExamForm: headers.indexOf('再検査フォーム'),
+      checkupStart: headers.indexOf('血圧'),
+      checkupEnd: headers.indexOf('その他'),
+    };
+    
+    // 必要な列が見つからない場合はエラー
+    for (const key in colIndex) {
+      if (colIndex[key] === -1) {
+        throw new Error(`「管理表」に'${key}'という列が見つかりません。`);
+      }
+    }
+
+    // 5. 提出期限を計算（3ヶ月後）
+    const deadline = new Date();
+    deadline.setMonth(deadline.getMonth() + 3);
+    const deadlineString = Utilities.formatDate(deadline, 'JST', 'yyyy年MM月dd日');
+    
+    // 6. 「管理表」を1行ずつチェックして、対象者にメールを送信
+    for (let i = 1; i < managementValues.length; i++) {
+      const row = managementValues[i];
+
+      // 送信対象の条件をチェック
+      const isTarget = row[colIndex.result] === '再検査' &&
+                       !row[colIndex.resultSentDate] && // 空欄であることをチェック
+                       !row[colIndex.reportArrivalDate]; // 空欄であることをチェック
+
+      if (isTarget) {
+        const name = row[colIndex.kanjiName];
+        const email = contactMap.get(name);
+        
+        if (!email) {
+          // Logger.log(`【スキップ】${name} さんのメールアドレスが連絡先シートに見つかりません。`);
+          continue;
+        }
+        
+        const formUrl = row[colIndex.reExamForm];
+
+        // 7. 検査項目のリストを作成
+        const checkupItems = [];
+        for (let j = colIndex.checkupStart; j <= colIndex.checkupEnd; j++) {
+          if (row[j]) { // セルに何か値が入っていたら
+            const headerName = headers[j];
+            if (headerName === 'その他') {
+              checkupItems.push(`・その他（${row[j]}）`); // その他列はセルの値を記載
+            } else {
+              checkupItems.push(`・${headerName}`); // それ以外の項目は列名を記載
+            }
+          }
+        }
+
+        // 8. メール本文を作成
+        const checkupItemsString = checkupItems.join('\n');
+        
+        let mailBody = bodyTemplate
+          .replace('{{氏名}}', name)
+          .replace('{{提出期限}}', deadlineString);
+        
+        const insertionMarker = '健康診断の結果、以下の項目に検査又は治療が必要であるとの判定がありました。';
+        mailBody = mailBody.replace(insertionMarker, `${insertionMarker}\n\n${checkupItemsString}`);
+
+        let htmlBody = mailBody.replace(/\n/g, '<br>');
+
+        if (formUrl) {
+            const hyperlink = `<a href="${formUrl}">${formUrl}</a>`;
+            htmlBody = htmlBody.replace('{{再検査フォーム}}', hyperlink);
+        } else {
+            htmlBody = htmlBody.replace('{{再検査フォーム}}', '');
+        }
+
+        // メールを下書きとして作成（htmlBodyオプションを使用）
+        GmailApp.createDraft(email, subjectTemplate, '', { htmlBody: htmlBody });
+        
+        // 結果送付日に実行日を yyyy年M月d日 形式で記録
+        const sentDate = Utilities.formatDate(new Date(), 'JST', 'yyyy年M月d日');
+        managementSheet.getRange(i + 1, colIndex.resultSentDate + 1).setValue(sentDate);
+      }
+    }
+    SpreadsheetApp.getUi().alert('処理が完了しました。メール下書きを確認してください。');
+  } catch (e) {
+    Logger.log(`エラーが発生しました: ${e.message}`);
+    SpreadsheetApp.getUi().alert(`エラーが発生しました: ${e.message}`);
+  }
+}
+
