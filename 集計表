@@ -1,0 +1,131 @@
+/**
+ * 定数設定
+ * 実際のシート名に合わせて変更してください。
+ */
+const SHEET_FORM_RESPONSES = "フォームの回答"; // フォームの回答が蓄積されるシート名
+const SHEET_SUMMARY = "集計表";         // 転記先の集計シート名
+const JOIN_SEPARATOR = ",";           // 複数の回答を結合する際の区切り文字
+
+/**
+ * 特殊キーワード
+ * 集計表の1行目にこれらのキーワードを設定すると、GASが自動で処理します。
+ */
+const KEYWORD_TIMESTAMP = "_TIMESTAMP_"; // フォームの送信日時（投稿日）
+const KEYWORD_SEARCH_KEY = "_SEARCH_KEY_"; // 検索列（氏名 + タイムスタンプ）
+
+/**
+ * フォーム送信時に自動実行される関数
+ * この関数を「フォーム送信時」のトリガーに設定します。
+ * @param {Object} e イベントオブジェクト
+ */
+function onFormSubmit(e) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const formSheet = ss.getSheetByName(SHEET_FORM_RESPONSES);
+    const summarySheet = ss.getSheetByName(SHEET_SUMMARY);
+
+    if (!formSheet || !summarySheet) {
+      Logger.log("エラー: 指定されたシートが見つかりません。");
+      return;
+    }
+
+    // --- 1. フォームの回答（e.values）と見出し名を取得 ---
+    
+    // e.values: 送信された回答内容の「配列」 (例: ['2025/11/06 10:00', '山田太郎', '神戸本社', '姫路市医師会', ...])
+    // ※e.namedValuesは見出し名が重複する場合に正しく動作しないため、e.values（値の配列）を使用します。
+    const formResponses = e.values; 
+    
+    // フォームの回答シートの1行目（見出し行）を取得
+    const formHeaders = formSheet.getRange(1, 1, 1, formSheet.getLastColumn()).getValues()[0];
+    
+    // 見出し名をキーに、列のインデックス（番号）を格納するマップを作成
+    // (例: {'氏名': [1], '受診病院': [3, 4, 5, ...], '受診希望日': [17, 23, ...]})
+    const headerIndexMap = {};
+    formHeaders.forEach((header, index) => {
+      if (!headerIndexMap[header]) {
+        headerIndexMap[header] = [];
+      }
+      headerIndexMap[header].push(index);
+    });
+
+    // --- 2. 集計表の1行目（設定行）を取得 ---
+    const configRow = summarySheet.getRange(1, 1, 1, summarySheet.getLastColumn()).getValues()[0];
+
+    // --- 3. 設定行を元に、フォーム回答からデータを抽出し、新しい行を作成 ---
+    const newRow = [];
+    let nameForSearchKey = ""; // 検索キー用の氏名
+    let timestampForSearchKey = null; // 検索キー用のタイムスタンプ
+    let searchKeyColumnIndex = -1; // 検索キー列のインデックス
+
+    configRow.forEach((configHeader, colIndex) => {
+      if (!configHeader) {
+        // 設定セルが空欄の場合は、新しい行も空欄にする
+        newRow.push("");
+        return;
+      }
+
+      // --- 特殊キーワードの処理 ---
+      if (configHeader === KEYWORD_TIMESTAMP) {
+        const timestamp = formResponses[0]; // タイムスタンプは必ずe.values[0]
+        newRow.push(timestamp);
+        timestampForSearchKey = timestamp; // 検索キー用に保持
+        return;
+      }
+      
+      if (configHeader === KEYWORD_SEARCH_KEY) {
+        newRow.push(""); // 後でまとめて処理するため、一旦空欄
+        searchKeyColumnIndex = colIndex; // 検索キー列の場所を覚えておく
+        return;
+      }
+
+      // --- 通常の見出し名の処理（カンマ区切り対応） ---
+      const targetHeaders = configHeader.split(',');
+      const cellValues = [];
+
+      targetHeaders.forEach(headerName => {
+        const cleanedHeaderName = headerName.trim(); // 前後の空白を除去
+        
+        // 氏名を検索キー用に保持（設定行に「氏名」が含まれている場合）
+        if (cleanedHeaderName === "氏名") {
+           const nameIndices = headerIndexMap[cleanedHeaderName];
+           if (nameIndices && nameIndices.length > 0) {
+             nameForSearchKey = formResponses[nameIndices[0]]; // 最初の「氏名」列の値を使用
+           }
+        }
+        
+        // 見出し名に対応するインデックス（列番号）を取得
+        const indices = headerIndexMap[cleanedHeaderName];
+        if (indices) {
+          indices.forEach(index => {
+            const value = formResponses[index];
+            // 回答が空でない場合のみ追加
+            if (value !== "" && value !== null && value !== undefined) {
+              cellValues.push(value);
+            }
+          });
+        }
+      });
+      
+      // 取得した値を指定の区切り文字で結合してセルに入れる
+      newRow.push(cellValues.join(JOIN_SEPARATOR));
+    });
+
+    // --- 4. 検索キー列の処理 ---
+    if (searchKeyColumnIndex !== -1 && nameForSearchKey && timestampForSearchKey) {
+      // 日付オブジェクトを "yyyy/mm/dd hh:mm:ss.000" 形式にフォーマット
+      const formattedTimestamp = Utilities.formatDate(new Date(timestampForSearchKey), 
+                                                      Session.getScriptTimeZone(), 
+                                                      "yyyy/MM/dd HH:mm:ss.SSS");
+      newRow[searchKeyColumnIndex] = nameForSearchKey + formattedTimestamp;
+    }
+
+    // --- 5. 集計表に新しい行を追加 ---
+    summarySheet.appendRow(newRow);
+
+  } catch (err) {
+    Logger.log("エラーが発生しました: " + err.message);
+    Logger.log("スタックトレース: " + err.stack);
+    // 管理者（例: スクリプトのオーナー）にメールでエラーを通知する
+    // MailApp.sendEmail("your-email@example.com", "健康診断GASエラー", err.message + "\n\n" + err.stack);
+  }
+}
