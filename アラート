@@ -1,0 +1,137 @@
+function sendReExamReminder() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const managementSheet = ss.getSheetByName("管理表");
+    const contactSheet = ss.getSheetByName("連絡先");
+
+    // シートの存在チェック
+    if (!managementSheet || !contactSheet) {
+      SpreadsheetApp.getUi().alert("「管理表」または「連絡先」シートが見つかりません。");
+      return;
+    }
+
+    // --- 1. 連絡先リストの作成 ---
+    const contactData = contactSheet.getRange(2, 1, contactSheet.getLastRow() - 1, 2).getValues();
+    const contactList = contactData.reduce((acc, row) => {
+      const name = row[0]; // A列: 氏名
+      const email = row[1]; // B列: アドレス
+      if (name && email) {
+        acc[name] = email;
+      }
+      return acc;
+    }, {});
+
+    // --- 2. メールの件名と本文を取得 ---
+    const subject = contactSheet.getRange("H1").getValue();
+    const bodyTemplate = contactSheet.getRange("H2").getValue();
+
+    if (!subject || !bodyTemplate) {
+      SpreadsheetApp.getUi().alert("「連絡先」シートのG1セル(件名)またはG2セル(本文)が空です。");
+      return;
+    }
+
+    // --- 3. 送信対象者の抽出とメール送信 ---
+    const managementData = managementSheet.getDataRange().getValues();
+    const header = managementData[0];
+
+    // 列名からインデックスを動的に取得
+    const nameIndex = header.indexOf("漢字氏名"); // F列を想定
+    const resultSentDateIndex = header.indexOf("結果送付日"); // V列想定
+    const resultIndex = header.indexOf("結果判定"); // W列想定
+    const reportIndex = header.indexOf("報告書到着"); // X列想定
+    const lastContactDateIndex = header.indexOf("最新連絡日"); // AO列想定
+    const formUrlIndex = header.indexOf("再検査フォーム"); // AN列を想定
+
+    // 必要な列が存在するかチェック
+    const requiredColumns = {
+      "漢字氏名": nameIndex,
+      "結果送付日": resultSentDateIndex,
+      "結果判定": resultIndex,
+      "報告書到着": reportIndex,
+      "最新連絡日": lastContactDateIndex,
+      "再検査フォーム": formUrlIndex
+    };
+
+    for (const colName in requiredColumns) {
+      if (requiredColumns[colName] === -1) {
+        SpreadsheetApp.getUi().alert(`「管理表」に必要な列（${colName}）が見つかりません。`);
+        return;
+      }
+    }
+
+    // --- 日付の準備 ---
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); // 時刻をリセットして日付のみで比較
+
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+
+    const oneWeekAgo = new Date();
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+    
+    let sentCount = 0;
+    // ヘッダー行を除き、データを1行ずつチェック
+    for (let i = 1; i < managementData.length; i++) {
+      const row = managementData[i];
+      const name = row[nameIndex];
+
+      // 日付や値を取得
+      const resultSentDateValue = row[resultSentDateIndex];
+      const result = row[resultIndex];
+      const reportStatus = row[reportIndex];
+      const lastContactDateValue = row[lastContactDateIndex];
+      const formUrl = row[formUrlIndex];
+
+      // 結果送付日が空欄または日付形式でない場合はスキップ
+      if (!resultSentDateValue || !(resultSentDateValue instanceof Date) || !formUrl) {
+        continue;
+      }
+      const resultSentDate = new Date(resultSentDateValue);
+
+      // 最新連絡日が入力されている場合のみ日付オブジェクトに変換
+      const lastContactDate = lastContactDateValue instanceof Date ? new Date(lastContactDateValue) : null;
+      
+      // --- 送信条件の判定 ---
+      // 1. 結果送付日(V)が3ヶ月以上前
+      const isSentDateOld = resultSentDate < threeMonthsAgo;
+      // 2. 結果判定(W)が「再検査」
+      const isReExam = result === "再検査";
+      // 3. 報告書到着(X)が空欄
+      const isReportMissing = reportStatus === "";
+      // 4. 最新連絡日(AO)が空欄、または1週間以上前
+      const canContact = !lastContactDate || lastContactDate < oneWeekAgo;
+
+      // すべての条件を満たす場合に処理を実行
+      if (isSentDateOld && isReExam && isReportMissing && canContact) {
+        const email = contactList[name];
+        if (email) {
+          // 本文のプレースホルダーを実際の値に置き換え
+          let htmlBody = bodyTemplate.replace("{{氏名}}", name);
+          htmlBody = htmlBody.replace("{{再検査フォーム}}", `<a href="${formUrl}">${formUrl}</a>`);
+          // 改行をHTMLの<br>タグに変換
+          htmlBody = htmlBody.replace(/\n/g, '<br>');
+
+          // メール送信（HTML形式）
+          GmailApp.sendEmail(email, subject, "", {
+            htmlBody: htmlBody
+          });
+          
+          // 送信日をAO列に記録（行番号はi+1）
+          managementSheet.getRange(i + 1, lastContactDateIndex + 1).setValue(new Date());
+          
+          Logger.log(`メール送信完了: ${name}様 (${email})`);
+          sentCount++;
+        } else {
+          Logger.log(`送信先不明: ${name}様のメールアドレスが「連絡先」シートに見つかりません。`);
+        }
+      }
+    }
+    
+    SpreadsheetApp.getUi().alert(`${sentCount}件のメールを送信しました。詳細はログをご確認ください。`);
+
+  } catch (e) {
+    Logger.log(`エラーが発生しました: ${e.message}\nスタックトレース: ${e.stack}`);
+    SpreadsheetApp.getUi().alert(`処理中にエラーが発生しました。詳細はログをご確認ください。`);
+  }
+}
+
